@@ -20,6 +20,7 @@ class ItemStatus(Enum):
     PENDING = 0
     IN_PROGRESS = 1
     COMPLETED = 2
+    UNREACHABLE = 3
 
 @dataclass
 class Item:
@@ -180,7 +181,7 @@ class GroupRobotAlgorithm:
             return True
         return False
 
-    def decide_next_action(self, items: List[Item], robot_snapshots: List[RobotSnapshot], shelves: Dict[str, Shelf]) -> List[Direction]:
+    def decide_next_action(self, robot_snapshots: List[RobotSnapshot], shelves: Dict[str, Shelf]) -> List[Direction]:
         """
         Compute next action for each robot based on current state and tasks.
         
@@ -199,13 +200,15 @@ class GroupRobotAlgorithm:
                 end=robot.target, 
                 shelves=list(shelves.values())
             ) 
-            # TODO: next direction logic based on path
-            if len(path) < 2:
+            if path == []:
+                print(f"No path found. Robot ID: {robot.id} | Position: ({robot.x}, {robot.y}) -> Target: {robot.target}")
+                next_dir = Direction.STAY
+            elif len(path) == 1:
                 next_dir = Direction.STAY
             else:
                 next_step = path[1]
                 if not self.position_is_valid(next_step, robot_snapshots, shelves):
-                    print(f"Collision detected. Robot ID: {robot.id} | Position: ({robot.x}, {robot.y}) | Next: {next_step}")
+                    print(f"Collision detected. Robot ID: {robot.id} | Position: ({robot.x}, {robot.y}) -> Next: {next_step} -> Target: {robot.target}")
                     next_dir = Direction.STAY
                 else:
                     dx = next_step[0] - robot.x
@@ -235,7 +238,15 @@ class InteractiveSimulator:
         # Initialize shelves with items
         self.shelves = {}
         s_id = 0
-        for y in range(2, GRID_HEIGHT):
+        for y in range(2, 4):
+            for x in range(6, GRID_WIDTH-5):
+                if s_id in [i.shelf_id for i in self.items]:
+                    item = next(i for i in self.items if i.shelf_id == s_id)
+                    self.shelves[s_id] = Shelf(id=s_id, x=x, y=y, item_uuid=item.uuid)
+                else:
+                    self.shelves[s_id] = Shelf(id=s_id, x=x, y=y, item_uuid=None)
+                s_id += 1
+        for y in range(5, 7):
             for x in range(6, GRID_WIDTH-5):
                 if s_id in [i.shelf_id for i in self.items]:
                     item = next(i for i in self.items if i.shelf_id == s_id)
@@ -252,13 +263,12 @@ class InteractiveSimulator:
         
         self.algorithm = GroupRobotAlgorithm(GRID_WIDTH, GRID_HEIGHT, self.stations)
         self.tick = 0
+        self.actions = [Direction.STAY for _ in self.robots_physics]
 
-    def print_dashboard(self, robot_snapshots: List[RobotSnapshot]):
-        """Display current simulation state."""
-        pending_items = [item for item in self.items if item.status == ItemStatus.PENDING]
-        
+    def print_dashboard(self, robot_snapshots: List[RobotSnapshot], actions: List[Direction]):
+        """Display current simulation state."""        
         print("\n" + "="*60)
-        print(f" ⏱️  TICK: {self.tick} | 📋 Pending Tasks: {len(pending_items)}")
+        print(f" ⏱️  TICK: {self.tick}")
         print("-" * 60)
 
         # Build grid
@@ -298,22 +308,46 @@ class InteractiveSimulator:
             row_str = "".join(grid[y])
             print(f"{y:<2} {row_str}")
 
-        # Print status
+        # Print item status
         print("-" * 60)
-        task_str = "\n".join([f"[T{item.uuid}: Shelf {item.shelf_id} -> Station {item.target_station_id}]" for item in pending_items[:3]])
-        if len(pending_items) > 3: 
-            task_str += "\n ..."
-        print(f"Tasks:\n{task_str}")
+        print(f"Pending: {[i.shelf_id for i in self.items if i.status == ItemStatus.PENDING]}"
+              + f" | In-progress: {[i.shelf_id for i in self.items if i.status == ItemStatus.IN_PROGRESS]}"
+              + f" | Delivered: {[i.shelf_id for i in self.items if i.status == ItemStatus.COMPLETED]}")
+        item_status = []
+        for item in self.items:
+            if item.status == ItemStatus.COMPLETED:
+                status_symbol = "    ✅" 
+            elif item.status == ItemStatus.IN_PROGRESS:
+                status_symbol = "    🚚"
+            else:
+                status_symbol = "    ⌛"
+            shelf_position = self.shelves[item.shelf_id]
+            station_position = next(s for s in self.stations if s.id == item.target_station_id)
+            status_str = ""
+            status_str += f"{status_symbol} [{item.uuid}]: "
+            status_str += f"Shelf {item.shelf_id} ({shelf_position.x}, {shelf_position.y}) ".ljust(17)
+            status_str += f"-> Station {item.target_station_id} ({station_position.x}, {station_position.y})"
+            item_status.append(status_str)
+        item_status = item_status[:2] + ["    ..."]
+        print(f"Item Status:")
+        for status in item_status:
+            print(status)
         
+        # Print robot status
         robot_status = []
-        for r in robot_snapshots:
-            if r.carrying_item_uuid is None:
-                status = "Idle"
+        for i, r in enumerate(robot_snapshots):
+            if r.target is None:
+                robot_status.append("    " + f"R{r.id}:({r.x},{r.y}) -> target:Idle".ljust(28) 
+                                    + f"| carry: None".ljust(15) 
+                                    + f"| action: {actions[i].name}")
             else:
                 item = next((i for i in self.items if i.uuid == r.carrying_item_uuid), None)
-                status = f"Carry #{item.shelf_id}"
-            robot_status.append(f"R{r.id}:({r.x},{r.y}) {status}")
-        print(" | ".join(robot_status))
+                robot_status.append("    " + f"R{r.id}:({r.x},{r.y}) -> target:{r.target}".ljust(28) 
+                                    + f"| carry: {item.shelf_id if item else 'None'}".ljust(15) 
+                                    + f"| action: {actions[i].name}")
+        print("Robots Status:")
+        for status in robot_status:
+            print(status)
         print("="*60)
 
     def parse_input(self) -> int:
@@ -322,28 +356,42 @@ class InteractiveSimulator:
         Commands: [Enter] next frame | [t ShelfID StationID] add task | [q] quit
         """
         print("Instructions: [Enter] Next | [t ShelfID StationID] Add Task | [q] Quit")
-        raw = input("👉 Cmd: ").strip().lower()
-        
-        if raw == 'q':
-            sys.exit(0)
-        
-        if raw.startswith('t'):
-            try:
-                _, shelf_id, station_id = raw.split()
-                if self.shelves[shelf_id] is None:
-                    print(f"  ❌ Shelf ID {shelf_id} does not exist.")
-                if self.shelves[shelf_id].item_uuid is not None:
-                    print(f"  ❌ Shelf ID {shelf_id} already has an item.")
-                if station_id not in [s.id for s in self.stations]:
-                    print(f"  ❌ Station ID {station_id} does not exist.")
-                else:
-                    new_item = Item(shelf_id=int(shelf_id), uuid=shortuuid.ShortUUID().random(length=8), target_station_id=int(station_id))
-                    self.items.add(new_item)
-                    print(f"  ✅ New Task: Shelf {shelf_id} -> Station {station_id}")
-            except:
-                print("  ❌ Format Error, e.g.: t 1 0")
+        while True:
+            raw = input("👉 Cmd: ").strip().lower()
+            
+            if raw == 'q':
+                sys.exit(0)
+            if raw == '':
+                break
+            
+            if raw.startswith('t'):
+                print(f"debug: Adding new task: {raw}")
+                try:
+                    cmds = raw.split()
+                    if len(cmds) != 3:
+                        print(f"  ❌ Invalid command format. Use: <t shelf_id station_id>, e.g.: t 1 0")
+                        continue
 
-    def update_robot_status(self):
+                    shelf_id = int(cmds[1])
+                    station_id = int(cmds[2])
+                    if self.shelves[shelf_id] is None:
+                        print(f"  ❌ Shelf ID {shelf_id} does not exist.")
+                        continue
+                    if self.shelves[shelf_id].item_uuid is not None:
+                        print(f"  ❌ Shelf ID {shelf_id} already has an item.")
+                        continue
+                    if station_id not in [s.id for s in self.stations]:
+                        print(f"  ❌ Station ID {station_id} does not exist.")
+                        continue
+                    else:
+                        new_item = Item(shelf_id=shelf_id, uuid=shortuuid.ShortUUID().random(length=8), target_station_id=station_id)
+                        self.items.append(new_item)
+                        self.shelves[shelf_id].item_uuid = new_item.uuid
+                        print(f"  ✅ Created new item [{new_item.uuid}]: Shelf {shelf_id} -> Station {station_id}")
+                except:
+                    print(f"  ❌ Failed to add item")
+
+    def update_robot_targets(self):
         """Assign pending items to available robots."""
         pending_items = [item for item in self.items if item.status == ItemStatus.PENDING]
         if not pending_items:
@@ -362,15 +410,16 @@ class InteractiveSimulator:
             else:
                 break
 
-    def update_map_status(self):
+    def update_map_status(self, actions: List[Direction]):
         """Update item pickups and deliveries."""
-        for robot in self.robots_physics:
+        for i, robot in enumerate(self.robots_physics):
             # Handle shelf pickups
             for shelf in self.shelves.values():
                 if (shelf.x, shelf.y) == (robot.x, robot.y) and shelf.item_uuid is not None:
                     robot.carrying_item_uuid = shelf.item_uuid
                     shelf.item_uuid = None
                     item = next((it for it in self.items if it.uuid == robot.carrying_item_uuid), None)
+                    item.status = ItemStatus.IN_PROGRESS
                     # Route to target station
                     for station in self.stations:
                         if station.id == item.target_station_id:
@@ -393,26 +442,33 @@ class InteractiveSimulator:
             robot_snapshots = [r.get_snapshot() for r in self.robots_physics]
 
             # Display dashboard
-            self.print_dashboard(robot_snapshots)
+            self.print_dashboard(robot_snapshots, self.actions)
             
             # Parse user input
             self.parse_input()
             
             # Update task assignments
-            self.update_robot_status()
+            self.update_robot_targets()
             robot_snapshots = [r.get_snapshot() for r in self.robots_physics]
             
             # Compute actions
-            actions = self.algorithm.decide_next_action(self.items, robot_snapshots, self.shelves)
+            self.actions = self.algorithm.decide_next_action(robot_snapshots, self.shelves)
 
             # Execute physics
             for i, r in enumerate(self.robots_physics):
-                if i < len(actions):
-                    r.tick(actions[i])
+                if i < len(self.actions):
+                    r.tick(self.actions[i])
 
             # Update map state
-            self.update_map_status()
+            self.update_map_status(self.actions)
             self.tick += 1
+
+"""
+TODO:
+- resolve robot-robot collisions
+- path finding should consider other robots as dynamic obstacles
+"""
+
 
 if __name__ == "__main__":
     simulator = InteractiveSimulator()
