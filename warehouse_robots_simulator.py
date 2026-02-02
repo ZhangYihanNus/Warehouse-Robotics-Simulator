@@ -47,6 +47,7 @@ class RobotSnapshot:
     id: int
     x: int
     y: int
+    default: Tuple[int, int]
     carrying_item_uuid: Optional[str] 
     target: Optional[Tuple[int, int]] 
 
@@ -61,7 +62,7 @@ def heuristic(a, b):
     """Manhattan distance heuristic for A* pathfinding."""
     return abs(a[0] - b[0]) + abs(a[1] - b[1])
 
-def find_path(start: tuple, end: tuple, shelves: List[Shelf]) -> list:
+def find_path(start: tuple, end: tuple, shelves: List[Shelf], existing_paths: List[Tuple[int, List[Tuple[int, int]]]]) -> list:
     """
     A* pathfinding algorithm using Manhattan distance heuristic.
     
@@ -69,6 +70,7 @@ def find_path(start: tuple, end: tuple, shelves: List[Shelf]) -> list:
         start: (x, y) starting coordinates
         end: (x, y) target coordinates
         shelves: list of obstacles on the map
+        existing_paths: list of existing paths for other robots
 
     Returns:
         List of coordinates from start to end (inclusive), or empty list if no path exists.
@@ -78,7 +80,7 @@ def find_path(start: tuple, end: tuple, shelves: List[Shelf]) -> list:
     open_list = []
     heapq.heappush(open_list, (0, start))
     
-    came_from = {}
+    previous_step_pos = {}
     g_score = {start: 0}
     f_score = {start: heuristic(start, end)}
 
@@ -90,9 +92,9 @@ def find_path(start: tuple, end: tuple, shelves: List[Shelf]) -> list:
         if current == end:
             path = []
             key_pos = current
-            while key_pos in came_from:
+            while key_pos in previous_step_pos:
                 path.append(key_pos)
-                key_pos = came_from[key_pos]
+                key_pos = previous_step_pos[key_pos]
             path.append(start)
             return path[::-1]
 
@@ -107,22 +109,29 @@ def find_path(start: tuple, end: tuple, shelves: List[Shelf]) -> list:
         for neighbor in neighbors:
             nx, ny = neighbor
             
-            # Check grid boundaries
+            # If neighbor is out of bounds, skip
             if not (0 <= nx < GRID_WIDTH and 0 <= ny < GRID_HEIGHT):
                 continue
             
-            # Check for obstacles (allow target position even if occupied)
+            # If neighbor is occupied by a shelf and not the end position, skip
             if any(neighbor == (shelf.x, shelf.y) for shelf in shelves) and neighbor != end:
                 continue
 
             # Calculate new cost
-            tentative_g = g_score[current] + 1
+            tentative_g_of_neighbor = g_score[current] + 1
+
+            # If neighbor will be occupied by other robots in future, skip
+            for _, path in existing_paths:
+                if len(path) > tentative_g_of_neighbor and path[tentative_g_of_neighbor] == neighbor:
+                    # print(f"Path finding: Path blocked for neighbor {neighbor} with g {tentative_g_of_neighbor}")
+                    tentative_g_of_neighbor = float('inf')
+                    break
 
             # Update path if this route is better
-            if tentative_g < g_score.get(neighbor, float('inf')):
-                came_from[neighbor] = current
-                g_score[neighbor] = tentative_g
-                f = tentative_g + heuristic(neighbor, end)
+            if tentative_g_of_neighbor < g_score.get(neighbor, float('inf')):
+                previous_step_pos[neighbor] = current
+                g_score[neighbor] = tentative_g_of_neighbor
+                f = tentative_g_of_neighbor + heuristic(neighbor, end)
                 f_score[neighbor] = f
                 
                 # Add to open list if not already present
@@ -133,10 +142,11 @@ def find_path(start: tuple, end: tuple, shelves: List[Shelf]) -> list:
     return []
 
 class RobotPhysics:
-    def __init__(self, robot_id, start_x, start_y, shelves: Dict[str, Shelf], stations: List[Station]):
+    def __init__(self, robot_id, default_x, default_y, shelves: Dict[str, Shelf], stations: List[Station]):
         self.id = robot_id
-        self.x = start_x
-        self.y = start_y
+        self.x = default_x
+        self.y = default_y
+        self.default = (default_x, default_y)
         self.carrying_item_uuid = None
         self.shelves = shelves
         self.stations = stations
@@ -147,6 +157,7 @@ class RobotPhysics:
             id=self.id,
             x=self.x,
             y=self.y,
+            default=self.default,
             carrying_item_uuid=self.carrying_item_uuid,
             target=self.target
         )
@@ -169,7 +180,7 @@ class GroupRobotAlgorithm:
         self.stations_map = {s.id: s for s in stations}
 
     def position_is_valid(self, position: Tuple[int, int], robot_snapshots: List[RobotSnapshot], shelves: Dict[str, Shelf]) -> bool:
-        """Check if position is within bounds, unoccupied, and not blocking an empty shelf."""
+        """Check if position is within bounds, unoccupied by another robot, and not an empty shelf."""
         x, y = position
 
         if 0 <= x and x < GRID_WIDTH \
@@ -181,6 +192,22 @@ class GroupRobotAlgorithm:
             return True
         return False
 
+    def check_robot_collisions(self, paths: List[Tuple[int, List[Tuple[int, int]]]]) -> Set[int]:
+        robots_to_recalculate = set()
+        step = 0
+        while step < max(len(p[1]) for p in paths):
+            occupied_positions = set()
+            for r_id, path in paths:
+                if len(path) <= step or r_id in robots_to_recalculate:
+                    continue
+                if path[step] not in occupied_positions:
+                    occupied_positions.add(path[step])
+                else:
+                    robots_to_recalculate.add(r_id)
+                    # print(f"Collision detected for Robot ID: {r_id} at position {path[step]}")
+            step += 1
+        return robots_to_recalculate
+
     def decide_next_action(self, robot_snapshots: List[RobotSnapshot], shelves: Dict[str, Shelf]) -> List[Direction]:
         """
         Compute next action for each robot based on current state and tasks.
@@ -188,22 +215,44 @@ class GroupRobotAlgorithm:
         Returns:
             List of Direction actions matching robot order.
         """
+        paths: List[Tuple[int, List[Tuple[int, int]]]] = []
         actions = []
 
+        # Compute paths for each robot
         for robot in robot_snapshots:
-            if robot.target is None:
-                actions.append(Direction.STAY)
-                continue
+            target = robot.target if robot.target is not None else robot.default
 
             path = find_path(
                 start=(robot.x, robot.y), 
-                end=robot.target, 
-                shelves=list(shelves.values())
-            ) 
-            if path == []:
-                print(f"No path found. Robot ID: {robot.id} | Position: ({robot.x}, {robot.y}) -> Target: {robot.target}")
-                next_dir = Direction.STAY
-            elif len(path) == 1:
+                end=target, 
+                shelves=list(shelves.values()),
+                existing_paths=list()   # first calculate without considering other robots
+            )
+            paths.append((robot.id, path))
+        
+        # Sort paths by length (shortest first)
+        paths.sort(key=lambda x: len(x[1]) if len(x[1]) > 0 else float('inf'))
+
+        # Double check all paths for collisions, mark robots that need recalculation
+        robots_to_recalculate = self.check_robot_collisions(paths)
+        paths_without_collisions = [p for p in paths if p[0] not in robots_to_recalculate]
+
+        # Recalculate paths for robots that had collisions
+        for r_id in robots_to_recalculate:
+            robot = next(r for r in robot_snapshots if r.id == r_id)
+            target = robot.target if robot.target is not None else robot.default
+            path = find_path(
+                start=(robot.x, robot.y), 
+                end=target, 
+                shelves=list(shelves.values()),
+                existing_paths=paths_without_collisions  # consider existing paths to avoid collisions
+            )
+            paths_without_collisions.append((r_id, path))
+
+        # Decide next move for each robot
+        for robot in robot_snapshots:
+            path = next(p for r_id, p in paths_without_collisions if r_id == robot.id)
+            if len(path) <= 1:
                 next_dir = Direction.STAY
             else:
                 next_step = path[1]
@@ -223,16 +272,29 @@ class GroupRobotAlgorithm:
 class InteractiveSimulator:
 
     def __init__(self):
+        # Initialize stations
         self.stations = [
             Station(id=0, x=0, y=0),
-            Station(id=1, x=0, y=GRID_HEIGHT-1)
+            Station(id=1, x=GRID_WIDTH-1, y=GRID_HEIGHT-1)
         ]
+
+        # Initialize items
         self.items = [
             Item(shelf_id=1, uuid=shortuuid.ShortUUID().random(length=8), target_station_id=0),
             Item(shelf_id=4, uuid=shortuuid.ShortUUID().random(length=8), target_station_id=1),
             Item(shelf_id=7, uuid=shortuuid.ShortUUID().random(length=8), target_station_id=0),
             Item(shelf_id=9, uuid=shortuuid.ShortUUID().random(length=8), target_station_id=1),
-            Item(shelf_id=12, uuid=shortuuid.ShortUUID().random(length=8), target_station_id=0)
+            Item(shelf_id=12, uuid=shortuuid.ShortUUID().random(length=8), target_station_id=0),
+            Item(shelf_id=15, uuid=shortuuid.ShortUUID().random(length=8), target_station_id=1),
+            Item(shelf_id=18, uuid=shortuuid.ShortUUID().random(length=8), target_station_id=0),
+            Item(shelf_id=19, uuid=shortuuid.ShortUUID().random(length=8), target_station_id=0),
+            Item(shelf_id=20, uuid=shortuuid.ShortUUID().random(length=8), target_station_id=1),
+            Item(shelf_id=21, uuid=shortuuid.ShortUUID().random(length=8), target_station_id=1),
+            Item(shelf_id=22, uuid=shortuuid.ShortUUID().random(length=8), target_station_id=1),
+            Item(shelf_id=23, uuid=shortuuid.ShortUUID().random(length=8), target_station_id=0),
+            Item(shelf_id=24, uuid=shortuuid.ShortUUID().random(length=8), target_station_id=0),
+            Item(shelf_id=25, uuid=shortuuid.ShortUUID().random(length=8), target_station_id=0),
+            Item(shelf_id=26, uuid=shortuuid.ShortUUID().random(length=8), target_station_id=0),
         ]
         
         # Initialize shelves with items
@@ -257,8 +319,8 @@ class InteractiveSimulator:
                 
         # Create robots
         self.robots_physics = [
-            RobotPhysics(0, 1, GRID_HEIGHT-1, self.shelves, self.stations),
-            RobotPhysics(1, 2, GRID_HEIGHT-1, self.shelves, self.stations)
+            RobotPhysics(0, 0, GRID_HEIGHT-1, self.shelves, self.stations),
+            RobotPhysics(1, 1, GRID_HEIGHT-1, self.shelves, self.stations)
         ]
         
         self.algorithm = GroupRobotAlgorithm(GRID_WIDTH, GRID_HEIGHT, self.stations)
@@ -392,10 +454,8 @@ class InteractiveSimulator:
                     print(f"  ❌ Failed to add item")
 
     def update_robot_targets(self):
-        """Assign pending items to available robots."""
+        """Assign targets to robots."""
         pending_items = [item for item in self.items if item.status == ItemStatus.PENDING]
-        if not pending_items:
-            return
 
         for item in pending_items:
             # Skip if already assigned
@@ -410,7 +470,11 @@ class InteractiveSimulator:
             else:
                 break
 
-    def update_map_status(self, actions: List[Direction]):
+        idle_robots = [robot for robot in self.robots_physics if robot.target is None]
+        for robot in idle_robots:
+            robot.target = robot.default
+
+    def update_map_status(self):
         """Update item pickups and deliveries."""
         for i, robot in enumerate(self.robots_physics):
             # Handle shelf pickups
@@ -460,14 +524,8 @@ class InteractiveSimulator:
                     r.tick(self.actions[i])
 
             # Update map state
-            self.update_map_status(self.actions)
+            self.update_map_status()
             self.tick += 1
-
-"""
-TODO:
-- resolve robot-robot collisions
-- path finding should consider other robots as dynamic obstacles
-"""
 
 
 if __name__ == "__main__":
