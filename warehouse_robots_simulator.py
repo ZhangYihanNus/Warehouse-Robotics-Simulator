@@ -77,8 +77,12 @@ def find_path(start: tuple, end: tuple, shelves: List[Shelf], existing_paths: Li
     """
     
     # Initialize data structures
+    shelves_set = {(shelf.x, shelf.y) for shelf in shelves}
+
     open_list = []
+    open_set = set()
     heapq.heappush(open_list, (0, start))
+    open_set.add(start)
     
     previous_step_pos = {}
     g_score = {start: 0}
@@ -87,6 +91,7 @@ def find_path(start: tuple, end: tuple, shelves: List[Shelf], existing_paths: Li
     # Main A* loop
     while open_list:
         current_f, current = heapq.heappop(open_list)
+        open_set.remove(current)
 
         # Target reached - reconstruct path
         if current == end:
@@ -114,28 +119,42 @@ def find_path(start: tuple, end: tuple, shelves: List[Shelf], existing_paths: Li
                 continue
             
             # If neighbor is occupied by a shelf and not the end position, skip
-            if any(neighbor == (shelf.x, shelf.y) for shelf in shelves) and neighbor != end:
+            if neighbor in shelves_set and neighbor != end:
                 continue
 
             # Calculate new cost
             tentative_g_of_neighbor = g_score[current] + 1
 
-            # If neighbor will be occupied by other robots in future, skip
+            # If neighbor will be occupied by other robots, skip
             for _, path in existing_paths:
-                if len(path) > tentative_g_of_neighbor and path[tentative_g_of_neighbor] == neighbor:
-                    # print(f"Path finding: Path blocked for neighbor {neighbor} with g {tentative_g_of_neighbor}")
+                # If path is shorter than current g score, robot will be staying at last position (path[-1])
+                if len(path) <= tentative_g_of_neighbor:
+                    pos_at_time = path[-1]
+                    previous_pos = path[-1]
+                else:
+                    pos_at_time = path[tentative_g_of_neighbor]
+                    previous_pos = path[tentative_g_of_neighbor - 1]
+
+                if pos_at_time == neighbor \
+                or (previous_pos == neighbor and pos_at_time == current):
+                    
                     tentative_g_of_neighbor = float('inf')
                     break
+            
+            # If neighbor is unreachable, skip
+            if tentative_g_of_neighbor == float('inf'):
+                continue
 
             # Update path if this route is better
-            if tentative_g_of_neighbor < g_score.get(neighbor, float('inf')):
+            if neighbor not in g_score or tentative_g_of_neighbor < g_score[neighbor]:
                 previous_step_pos[neighbor] = current
                 g_score[neighbor] = tentative_g_of_neighbor
                 f = tentative_g_of_neighbor + heuristic(neighbor, end)
                 f_score[neighbor] = f
                 
                 # Add to open list if not already present
-                if not any(neighbor == item[1] for item in open_list):
+                if neighbor not in open_set:
+                    open_set.add(neighbor)
                     heapq.heappush(open_list, (f, neighbor))
 
     # No path found
@@ -180,12 +199,11 @@ class GroupRobotAlgorithm:
         self.stations_map = {s.id: s for s in stations}
 
     def position_is_valid(self, position: Tuple[int, int], robot_snapshots: List[RobotSnapshot], shelves: Dict[str, Shelf]) -> bool:
-        """Check if position is within bounds, unoccupied by another robot, and not an empty shelf."""
+        """Check if position is within bounds, and not an empty shelf."""
         x, y = position
 
         if 0 <= x and x < GRID_WIDTH \
-        and 0 <= y and y < GRID_HEIGHT \
-        and (x, y) not in [(r.x, r.y) for r in robot_snapshots]:
+        and 0 <= y and y < GRID_HEIGHT:
             for shelf in shelves.values():
                 if (shelf.x, shelf.y) == position and shelf.item_uuid is None:
                     return False
@@ -193,19 +211,49 @@ class GroupRobotAlgorithm:
         return False
 
     def check_robot_collisions(self, paths: List[Tuple[int, List[Tuple[int, int]]]]) -> Set[int]:
+        """Check for collisions in planned paths and return robot IDs that need recalculation."""
         robots_to_recalculate = set()
         step = 0
-        while step < max(len(p[1]) for p in paths):
-            occupied_positions = set()
-            for r_id, path in paths:
-                if len(path) <= step or r_id in robots_to_recalculate:
+        max_steps = max(len(p[1]) for p in paths) if paths else 0
+        for step in range(max_steps):
+            current_position_owners = {}
+            for robot_id, path in paths:
+                if robot_id in robots_to_recalculate:
                     continue
-                if path[step] not in occupied_positions:
-                    occupied_positions.add(path[step])
+
+                # get current and previous positions
+                if step == 0:
+                    previous_pos = None
+                if step >= len(path):
+                    current_pos = path[-1]
+                    previous_pos = path[-1]
                 else:
-                    robots_to_recalculate.add(r_id)
-                    # print(f"Collision detected for Robot ID: {r_id} at position {path[step]}")
-            step += 1
+                    current_pos = path[step]
+                    previous_pos = path[step - 1]
+
+                # check current positions for collisions
+                if current_pos in current_position_owners.keys():
+                    # print(f"Collision in path at position {current_pos} between Robot {robot_id} and Robot {current_position_owners[current_pos]}")
+                    robots_to_recalculate.add(robot_id)
+                    continue
+                else:
+                    current_position_owners[current_pos] = robot_id
+
+                # check previous positions for swap collisions
+                if previous_pos == None:
+                    continue
+                if previous_pos in current_position_owners.keys() and current_position_owners[previous_pos] != robot_id:
+                    other_robot_id = current_position_owners[previous_pos]
+                    other_robot_path = next(p for r_id, p in paths if r_id == other_robot_id)
+                    if step >= len(other_robot_path):
+                        other_previous_pos = other_robot_path[-1]
+                    else:
+                        other_previous_pos = other_robot_path[step - 1]
+                    if other_previous_pos == current_pos:
+                        # print(f"Swap collision in path between Robot {robot_id} and Robot {other_robot_id} at position {current_pos}")
+                        robots_to_recalculate.add(robot_id)
+                        continue
+            
         return robots_to_recalculate
 
     def decide_next_action(self, robot_snapshots: List[RobotSnapshot], shelves: Dict[str, Shelf]) -> List[Direction]:
@@ -320,7 +368,8 @@ class InteractiveSimulator:
         # Create robots
         self.robots_physics = [
             RobotPhysics(0, 0, GRID_HEIGHT-1, self.shelves, self.stations),
-            RobotPhysics(1, 1, GRID_HEIGHT-1, self.shelves, self.stations)
+            RobotPhysics(1, 1, GRID_HEIGHT-1, self.shelves, self.stations),
+            RobotPhysics(2, 2, GRID_HEIGHT-1, self.shelves, self.stations)
         ]
         
         self.algorithm = GroupRobotAlgorithm(GRID_WIDTH, GRID_HEIGHT, self.stations)
@@ -469,10 +518,6 @@ class InteractiveSimulator:
                 nearest_robot.target = (self.shelves[item.shelf_id].x, self.shelves[item.shelf_id].y)
             else:
                 break
-
-        idle_robots = [robot for robot in self.robots_physics if robot.target is None]
-        for robot in idle_robots:
-            robot.target = robot.default
 
     def update_map_status(self):
         """Update item pickups and deliveries."""
